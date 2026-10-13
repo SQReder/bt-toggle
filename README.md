@@ -15,8 +15,17 @@
 
 ## Сборка
 
+Готовый `bt-toggle.exe` лежит в [Releases](https://github.com/SQReder/bt-toggle/releases). Чтобы собрать самому:
+
 ```powershell
 cargo build --release   # target\release\bt-toggle.exe
+```
+
+Релиз собирает GitHub Actions на тег `v*`; держи номер версии в `Cargo.toml` в соответствии с тегом:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 Установка или обновление (сначала выйди из запущенного трея):

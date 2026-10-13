@@ -19,6 +19,15 @@
 cargo build --release   # target\release\bt-toggle.exe
 ```
 
+Установка или обновление (сначала выйди из запущенного трея):
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\bt-toggle"
+New-Item -ItemType Directory -Force $dir | Out-Null
+Copy-Item .\target\release\bt-toggle.exe $dir -Force
+Start-Process "$dir\bt-toggle.exe"   # затем включи автозапуск в меню
+```
+
 ## Как это устроено
 
 **Подключение.** Для каждого аудиовыхода (воспроизведение и запись) утилита идёт по топологии устройства до KS-фильтра Bluetooth-драйвера (`bthenum` — A2DP, `bthhfenum` — Hands-Free). Затем шлёт ему `KSPROPERTY_ONESHOT_RECONNECT` / `KSPROPERTY_ONESHOT_DISCONNECT` из набора `KSPROPSETID_BtAudio`. Это тот же механизм, которым пользуется Windows. Подход взят из [ToothTray](https://github.com/m2jean/ToothTray) (BSD-2).

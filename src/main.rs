@@ -1,157 +1,241 @@
-//! Prototype: connect/disconnect a paired Bluetooth audio device the same way
-//! Windows does, by sending one-shot KS properties to the Bluetooth audio
-//! driver (mechanism from ToothTray, BSD-2: https://github.com/m2jean/ToothTray).
+//! Tray icon that connects/disconnects one Bluetooth audio device on left click.
 
-use std::collections::BTreeMap;
+#![windows_subsystem = "windows"]
 
-use windows::Win32::Devices::FunctionDiscovery::{PKEY_Device_ContainerId, PKEY_Device_FriendlyName};
-use windows::Win32::Foundation::PROPERTYKEY;
-use windows::Win32::Media::Audio::{
-    DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATEMASK_ALL, IDeviceTopology, IMMDevice,
-    IMMDeviceEnumerator, IPart, MMDeviceEnumerator, eAll,
-};
-use windows::Win32::Media::KernelStreaming::{
-    IKsControl, KSIDENTIFIER, KSIDENTIFIER_0, KSIDENTIFIER_0_0, KSPROPERTY_BTAUDIO,
-    KSPROPERTY_ONESHOT_DISCONNECT, KSPROPERTY_ONESHOT_RECONNECT, KSPROPERTY_TYPE_GET,
-    KSPROPSETID_BtAudio,
-};
-use windows::Win32::System::Com::StructuredStorage::PropVariantToBSTR;
-use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STGM_READ,
-};
-use windows::core::{HSTRING, Interface, Result};
+mod bt;
+mod sys;
 
-// Device ids of Bluetooth audio KS filters: bthenum (A2DP) or bthhfenum (Hands-Free).
-const BT_AUDIO_DEVICE_ID_PREFIX: &str = r"{2}.\\?\bth";
+use std::time::{Duration, Instant};
 
-/// One physical device: all its audio endpoints share a container id.
-struct BtAudioDevice {
-    endpoint_names: Vec<String>,
-    connected: bool,
-    controls: Vec<IKsControl>,
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, SetTimer, TranslateMessage};
+
+const TICK_MS: u32 = 250;
+// ponytail: state is polled; switch to IMMNotificationClient if polling ever shows up in CPU.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+const BLUE: [u8; 3] = [0x60, 0xa5, 0xfa];
+const AMBER: [u8; 3] = [0xfb, 0xbf, 0x24];
+const GRAY: [u8; 3] = [0x9c, 0xa3, 0xaf];
+
+#[derive(Clone, Copy, PartialEq)]
+enum State {
+    Disconnected,
+    Connecting,
+    Connected,
 }
 
-impl BtAudioDevice {
-    fn send(&self, property: KSPROPERTY_BTAUDIO) -> Result<()> {
-        let identifier = KSIDENTIFIER {
-            Anonymous: KSIDENTIFIER_0 {
-                Anonymous: KSIDENTIFIER_0_0 {
-                    Set: KSPROPSETID_BtAudio,
-                    Id: property.0 as u32,
-                    Flags: KSPROPERTY_TYPE_GET,
-                },
-            },
+/// 32x32 headphones glyph: a headband arc over two ear cups.
+fn headphones_icon(color: [u8; 3]) -> Icon {
+    const SIZE: u32 = 32;
+    const CENTER: f32 = 15.5;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let (fx, fy) = (x as f32, y as f32);
+            let distance = ((fx - CENTER).powi(2) + (fy - 17.0).powi(2)).sqrt();
+            let band = fy <= 17.0 && (10.5..=13.5).contains(&distance);
+            let cup = (16..=28).contains(&y) && ((2..=8).contains(&x) || (23..=29).contains(&x));
+            let pixel = if band || cup { [color[0], color[1], color[2], 255] } else { [0; 4] };
+            rgba.extend_from_slice(&pixel);
+        }
+    }
+    Icon::from_rgba(rgba, SIZE, SIZE).expect("icon buffer matches its size")
+}
+
+fn notify(text: &str) {
+    // A failed toast has nowhere else to go: there is no console or window.
+    let _ = sys::toast(text);
+}
+
+struct App {
+    tray: TrayIcon,
+    icons: [Icon; 3],
+    devices: Vec<bt::Device>,
+    selected: Option<String>,
+    connecting_since: Option<Instant>,
+    last_poll: Instant,
+    shown: Option<(State, String)>,
+    menu_devices: Vec<(String, String)>,
+    device_items: Vec<(CheckMenuItem, String)>,
+    autostart: CheckMenuItem,
+    quit: MenuItem,
+}
+
+impl App {
+    fn new() -> Self {
+        let icons = [headphones_icon(GRAY), headphones_icon(AMBER), headphones_icon(BLUE)];
+        let tray = TrayIconBuilder::new()
+            .with_icon(icons[0].clone())
+            .with_tooltip("bt-toggle")
+            .with_menu_on_left_click(false)
+            .build()
+            .expect("tray icon is created");
+        let mut app = Self {
+            tray,
+            icons,
+            devices: Vec::new(),
+            selected: sys::load_device(),
+            connecting_since: None,
+            last_poll: Instant::now(),
+            shown: None,
+            menu_devices: Vec::new(),
+            device_items: Vec::new(),
+            autostart: CheckMenuItem::new("Запускать при входе в Windows", true, sys::autostart_enabled(), None),
+            quit: MenuItem::new("Выход", true, None),
         };
-        // Windows drops the link only after every endpoint (A2DP + HFP) is told to.
-        for control in &self.controls {
-            let mut bytes_returned = 0;
-            unsafe {
-                control.KsProperty(
-                    &identifier,
-                    size_of::<KSIDENTIFIER>() as u32,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut bytes_returned,
-                )?;
+        app.poll();
+        app
+    }
+
+    fn selected_device(&self) -> Option<&bt::Device> {
+        let selected = self.selected.as_deref()?;
+        self.devices.iter().find(|d| d.id == selected)
+    }
+
+    /// Returns false when the user asked to quit.
+    fn handle_events(&mut self) -> bool {
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                self.toggle();
             }
         }
-        Ok(())
-    }
-}
-
-fn read_string(device: &IMMDevice, key: &PROPERTYKEY) -> Result<String> {
-    unsafe {
-        let value = device.OpenPropertyStore(STGM_READ)?.GetValue(key)?;
-        Ok(PropVariantToBSTR(&value)?.to_string())
-    }
-}
-
-/// Finds the Bluetooth audio driver control behind each connector of the endpoint.
-fn bt_controls(enumerator: &IMMDeviceEnumerator, endpoint: &IMMDevice) -> Result<Vec<IKsControl>> {
-    let mut controls = Vec::new();
-    unsafe {
-        let topology: IDeviceTopology = endpoint.Activate(CLSCTX_ALL, None)?;
-        for index in 0..topology.GetConnectorCount()? {
-            let Ok(other) = topology.GetConnector(index)?.GetConnectedTo() else {
-                continue;
-            };
-            let other_id = other.cast::<IPart>()?.GetTopologyObject()?.GetDeviceId()?.to_string()?;
-            if !other_id.starts_with(BT_AUDIO_DEVICE_ID_PREFIX) {
-                continue;
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == *self.quit.id() {
+                return false;
             }
-            let driver = enumerator.GetDevice(&HSTRING::from(other_id))?;
-            controls.push(driver.Activate(CLSCTX_ALL, None)?);
-        }
-    }
-    Ok(controls)
-}
-
-fn enumerate() -> Result<Vec<BtAudioDevice>> {
-    let mut by_container: BTreeMap<String, BtAudioDevice> = BTreeMap::new();
-    unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        // Capture endpoints too: the Hands-Free link may be reachable only via the mic,
-        // and Windows keeps the device connected while HFP is up.
-        let endpoints = enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE(DEVICE_STATEMASK_ALL))?;
-        for index in 0..endpoints.GetCount()? {
-            let endpoint = endpoints.Item(index)?;
-            // Stale endpoints of removed devices have no topology; skip them.
-            let Ok(controls) = bt_controls(&enumerator, &endpoint) else {
-                continue;
-            };
-            if controls.is_empty() {
-                continue;
+            if event.id == *self.autostart.id() {
+                let enabled = self.autostart.is_checked();
+                if let Err(error) = sys::set_autostart(enabled) {
+                    self.autostart.set_checked(!enabled);
+                    notify(&format!("Не удалось изменить автозапуск: {error}"));
+                }
+            } else if let Some(id) = self.device_items.iter().find(|(item, _)| *item.id() == event.id).map(|(_, id)| id.clone()) {
+                self.select(id);
             }
-            let device = by_container
-                .entry(read_string(&endpoint, &PKEY_Device_ContainerId)?)
-                .or_insert_with(|| BtAudioDevice {
-                    endpoint_names: Vec::new(),
-                    connected: false,
-                    controls: Vec::new(),
-                });
-            device.endpoint_names.push(read_string(&endpoint, &PKEY_Device_FriendlyName)?);
-            device.connected |= endpoint.GetState()? == DEVICE_STATE_ACTIVE;
-            device.controls.extend(controls);
         }
+        if self.last_poll.elapsed() >= POLL_INTERVAL {
+            self.poll();
+        }
+        true
     }
-    Ok(by_container.into_values().collect())
+
+    fn select(&mut self, id: String) {
+        for (item, item_id) in &self.device_items {
+            item.set_checked(*item_id == id);
+        }
+        if let Err(error) = sys::save_device(&id) {
+            notify(&format!("Не удалось запомнить выбор: {error}"));
+        }
+        self.selected = Some(id);
+        self.connecting_since = None;
+        self.render();
+    }
+
+    fn toggle(&mut self) {
+        self.poll();
+        let Some(device) = self.selected_device() else {
+            notify("Выбери наушники: правый клик по иконке");
+            return;
+        };
+        let connected = device.connected;
+        let result = if connected { device.disconnect() } else { device.connect() };
+        match result {
+            Ok(()) if !connected => self.connecting_since = Some(Instant::now()),
+            Ok(()) => {}
+            Err(error) => notify(&format!("{}: {error}", device.name)),
+        }
+        self.render();
+    }
+
+    fn poll(&mut self) {
+        self.last_poll = Instant::now();
+        self.devices = match bt::enumerate() {
+            Ok(devices) => devices,
+            Err(error) => {
+                self.tray.set_tooltip(Some(format!("bt-toggle: {error}"))).ok();
+                return;
+            }
+        };
+        if let Some(since) = self.connecting_since {
+            let device = self.selected_device();
+            let connected = device.is_some_and(|d| d.connected);
+            let name = device.map_or("Устройство".to_string(), |d| d.name.clone());
+            if connected {
+                self.connecting_since = None;
+            } else if since.elapsed() > CONNECT_TIMEOUT {
+                self.connecting_since = None;
+                notify(&format!("{name} не подключились. Включены и не в кейсе?"));
+            }
+        }
+        self.rebuild_menu_if_changed();
+        self.render();
+    }
+
+    fn rebuild_menu_if_changed(&mut self) {
+        let menu_devices: Vec<(String, String)> = self.devices.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+        if menu_devices == self.menu_devices {
+            return;
+        }
+        let menu = Menu::new();
+        self.device_items = menu_devices
+            .iter()
+            .map(|(id, name)| (CheckMenuItem::new(name, true, self.selected.as_ref() == Some(id), None), id.clone()))
+            .collect();
+        for (item, _) in &self.device_items {
+            menu.append(item).ok();
+        }
+        if self.device_items.is_empty() {
+            menu.append(&MenuItem::new("Нет сопряжённых аудиоустройств", false, None)).ok();
+        }
+        menu.append(&PredefinedMenuItem::separator()).ok();
+        menu.append(&self.autostart).ok();
+        menu.append(&self.quit).ok();
+        self.tray.set_menu(Some(Box::new(menu)));
+        self.menu_devices = menu_devices;
+    }
+
+    fn render(&mut self) {
+        let (state, tooltip) = match self.selected_device() {
+            None if self.selected.is_none() => (State::Disconnected, "Выбери наушники: правый клик".to_string()),
+            None => (State::Disconnected, "Выбранное устройство не найдено".to_string()),
+            Some(device) if device.connected => {
+                let battery = device.battery.map(|b| format!(" · {b}%")).unwrap_or_default();
+                (State::Connected, format!("{}: подключены{battery}", device.name))
+            }
+            Some(device) if self.connecting_since.is_some() => (State::Connecting, format!("{}: подключаю…", device.name)),
+            Some(device) => (State::Disconnected, format!("{}: отключены", device.name)),
+        };
+        if self.shown.as_ref().is_some_and(|shown| shown.0 == state && shown.1 == tooltip) {
+            return;
+        }
+        self.tray.set_icon(Some(self.icons[state as usize].clone())).ok();
+        self.tray.set_tooltip(Some(&tooltip)).ok();
+        self.shown = Some((state, tooltip));
+    }
 }
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let (command, filter) = match args.as_slice() {
-        [] => ("list", ""),
-        [command] if command == "list" => ("list", ""),
-        [command, filter] if command == "connect" || command == "disconnect" => {
-            (command.as_str(), filter.as_str())
-        }
-        _ => {
-            eprintln!("usage: bt-toggle [list | connect <name> | disconnect <name>]");
-            std::process::exit(2);
-        }
-    };
-
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
-    let devices = enumerate()?;
-
-    if command == "list" {
-        for device in &devices {
-            let state = if device.connected { "connected" } else { "disconnected" };
-            println!("[{state}] {}", device.endpoint_names.join(" | "));
-        }
-        return Ok(());
+fn main() {
+    if sys::already_running() {
+        return;
     }
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().expect("COM is initialized") };
+    let _ = sys::register_toast_app();
+    let mut app = App::new();
 
-    let filter = filter.to_lowercase();
-    let Some(device) = devices
-        .iter()
-        .find(|d| d.endpoint_names.iter().any(|n| n.to_lowercase().contains(&filter)))
-    else {
-        eprintln!("no Bluetooth audio device matches {filter:?}");
-        std::process::exit(1);
-    };
-    let property = if command == "connect" { KSPROPERTY_ONESHOT_RECONNECT } else { KSPROPERTY_ONESHOT_DISCONNECT };
-    device.send(property)?;
-    println!("{command} sent to {}", device.endpoint_names.join(" | "));
-    Ok(())
+    // Thread timer: wakes the loop so tray/menu channels and polling are serviced.
+    unsafe { SetTimer(None, 0, TICK_MS, None) };
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if !app.handle_events() {
+            break;
+        }
+    }
 }

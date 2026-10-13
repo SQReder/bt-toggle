@@ -2,6 +2,7 @@
 name = "bt-toggle"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 tray-icon = "0.26.1"

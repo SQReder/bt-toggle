@@ -21,6 +21,16 @@ const BLUE: [u8; 3] = [0x60, 0xa5, 0xfa];
 const AMBER: [u8; 3] = [0xfb, 0xbf, 0x24];
 const GRAY: [u8; 3] = [0x9c, 0xa3, 0xaf];
 
+/// Battery bar color by level: green, then yellow below 40, orange below 30, red below 20.
+fn battery_color(percent: u8) -> [u8; 3] {
+    match percent {
+        0..=19 => [0xf8, 0x71, 0x71],
+        20..=29 => [0xfb, 0x92, 0x3c],
+        30..=39 => [0xfa, 0xcc, 0x15],
+        _ => [0x4a, 0xde, 0x80],
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Disconnected,
@@ -28,18 +38,34 @@ enum State {
     Connected,
 }
 
-/// 32x32 headphones glyph: a headband arc over two ear cups.
-fn headphones_icon(color: [u8; 3]) -> Icon {
+/// 32x32 icon: headphones glyph (headband arc over two ear cups) and, when the
+/// level is known, a vertical battery bar on the right that fills from the bottom.
+fn tray_icon(color: [u8; 3], battery: Option<u8>) -> Icon {
     const SIZE: u32 = 32;
-    const CENTER: f32 = 15.5;
+    const BAR_LEFT: u32 = 26;
+    const BAR_RIGHT: u32 = 30;
+    const BAR_TOP: u32 = 4;
+    const BAR_BOTTOM: u32 = 27;
+    const TRACK: [u8; 4] = [GRAY[0], GRAY[1], GRAY[2], 90];
+    let bar_height = BAR_BOTTOM - BAR_TOP + 1;
+    let fill_top = battery.map(|b| BAR_BOTTOM + 1 - (bar_height * u32::from(b.min(100)) + 50) / 100);
+    let bar_color = battery.map_or(color, battery_color);
+    let opaque = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
         for x in 0..SIZE {
             let (fx, fy) = (x as f32, y as f32);
-            let distance = ((fx - CENTER).powi(2) + (fy - 17.0).powi(2)).sqrt();
-            let band = fy <= 17.0 && (10.5..=13.5).contains(&distance);
-            let cup = (16..=28).contains(&y) && ((2..=8).contains(&x) || (23..=29).contains(&x));
-            let pixel = if band || cup { [color[0], color[1], color[2], 255] } else { [0; 4] };
+            let distance = ((fx - 11.5).powi(2) + (fy - 16.0).powi(2)).sqrt();
+            let band = fy <= 16.0 && (8.5..=11.0).contains(&distance);
+            let cup = (15..=27).contains(&y) && ((1..=5).contains(&x) || (18..=22).contains(&x));
+            let in_bar = (BAR_LEFT..=BAR_RIGHT).contains(&x) && (BAR_TOP..=BAR_BOTTOM).contains(&y);
+            let pixel = match fill_top {
+                _ if band || cup => opaque(color),
+                Some(top) if in_bar && y >= top => opaque(bar_color),
+                Some(_) if in_bar => TRACK,
+                _ => [0; 4],
+            };
             rgba.extend_from_slice(&pixel);
         }
     }
@@ -53,7 +79,6 @@ fn notify(text: &str) {
 
 struct App {
     tray: TrayIcon,
-    icons: [Icon; 3],
     devices: Vec<bt::Device>,
     selected: Option<String>,
     connecting_since: Option<Instant>,
@@ -67,16 +92,14 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let icons = [headphones_icon(GRAY), headphones_icon(AMBER), headphones_icon(BLUE)];
         let tray = TrayIconBuilder::new()
-            .with_icon(icons[0].clone())
+            .with_icon(tray_icon(GRAY, None))
             .with_tooltip("bt-toggle")
             .with_menu_on_left_click(false)
             .build()
             .expect("tray icon is created");
         let mut app = Self {
             tray,
-            icons,
             devices: Vec::new(),
             selected: sys::load_device(),
             connecting_since: None,
@@ -199,20 +222,28 @@ impl App {
     }
 
     fn render(&mut self) {
-        let (state, tooltip) = match self.selected_device() {
-            None if self.selected.is_none() => (State::Disconnected, "Выбери наушники: правый клик".to_string()),
-            None => (State::Disconnected, "Выбранное устройство не найдено".to_string()),
+        let (state, battery, tooltip) = match self.selected_device() {
+            None if self.selected.is_none() => (State::Disconnected, None, "Выбери наушники: правый клик".to_string()),
+            None => (State::Disconnected, None, "Выбранное устройство не найдено".to_string()),
             Some(device) if device.connected => {
-                let battery = device.battery.map(|b| format!(" · {b}%")).unwrap_or_default();
-                (State::Connected, format!("{}: подключены{battery}", device.name))
+                let percent = device.battery.map(|b| format!(" · {b}%")).unwrap_or_default();
+                (State::Connected, device.battery, format!("{}: подключены{percent}", device.name))
             }
-            Some(device) if self.connecting_since.is_some() => (State::Connecting, format!("{}: подключаю…", device.name)),
-            Some(device) => (State::Disconnected, format!("{}: отключены", device.name)),
+            Some(device) if self.connecting_since.is_some() => {
+                (State::Connecting, None, format!("{}: подключаю…", device.name))
+            }
+            Some(device) => (State::Disconnected, None, format!("{}: отключены", device.name)),
         };
+        // The tooltip carries the battery percent, so it also covers bar changes.
         if self.shown.as_ref().is_some_and(|shown| shown.0 == state && shown.1 == tooltip) {
             return;
         }
-        self.tray.set_icon(Some(self.icons[state as usize].clone())).ok();
+        let color = match state {
+            State::Disconnected => GRAY,
+            State::Connecting => AMBER,
+            State::Connected => BLUE,
+        };
+        self.tray.set_icon(Some(tray_icon(color, battery))).ok();
         self.tray.set_tooltip(Some(&tooltip)).ok();
         self.shown = Some((state, tooltip));
     }
